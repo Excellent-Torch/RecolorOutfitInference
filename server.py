@@ -2,6 +2,7 @@
 Clothing Recolor API Server
 FastAPI server for recoloring clothing in images.
 """
+import traceback
 from functools import lru_cache
 
 import cv2
@@ -49,9 +50,10 @@ def get_masks(image: np.ndarray) -> np.ndarray:
     # Person segmentation
     results = get_model()(image, verbose=False, conf=0.5, classes=[0])[0]
     person_mask = np.zeros((h, w), dtype=np.uint8)
-    if results.masks is not None:
+    if results.masks is not None and len(results.masks.data) > 0:
         combined = results.masks.data.sum(0).clamp(0, 1).cpu().numpy()
-        person_mask = (cv2.resize(combined, (w, h)) * 255).astype(np.uint8)
+        combined = (combined * 255).astype(np.uint8)  # Convert to uint8 BEFORE resize
+        person_mask = cv2.resize(combined, (w, h), interpolation=cv2.INTER_LINEAR)
     
     # Skin detection
     hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
@@ -111,6 +113,8 @@ async def recolor_endpoint(
     except HTTPException:
         raise
     except Exception as e:
+        print(f"ERROR: {e}")
+        traceback.print_exc()
         raise HTTPException(500, str(e))
 
 
