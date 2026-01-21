@@ -27,7 +27,7 @@ app.add_middleware(
 @lru_cache(maxsize=1)
 def get_model():
     """Load model once and cache."""
-    return YOLO('yolo11m-seg.pt')
+    return YOLO('yolo11l-seg.pt')
 
 
 @app.on_event("startup")
@@ -69,21 +69,68 @@ def get_masks(image: np.ndarray) -> np.ndarray:
 
 
 def recolor(image: np.ndarray, target_hsv: tuple, mask: np.ndarray) -> np.ndarray:
-    """Recolor clothing preserving texture."""
+    """Recolor clothing preserving texture. Handles white/light areas aggressively."""
     hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV).astype(np.float32)
+    lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB).astype(np.float32)
     m = (mask / 255.0).astype(np.float32)
     
+    target_h, target_s, target_v = target_hsv
+    original_h = hsv[:, :, 0].copy()
+    original_s = hsv[:, :, 1].copy()
     original_v = hsv[:, :, 2].copy()
-    hsv[:, :, 0] = hsv[:, :, 0] * (1 - m) + target_hsv[0] * m
-    hsv[:, :, 1] = hsv[:, :, 1] * (1 - m * 0.7) + target_hsv[1] * m * 0.7
-    hsv[:, :, 2] = original_v
+    
+    # Luminance from LAB (more perceptually accurate)
+    luminance = lab[:, :, 0] / 255.0
+    
+    # Categorize pixels by saturation
+    very_low_sat = (original_s < 30).astype(np.float32)  # Pure white/gray
+    low_sat = ((original_s >= 30) & (original_s < 80)).astype(np.float32)
+    mid_sat = ((original_s >= 80) & (original_s < 150)).astype(np.float32)
+    high_sat = (original_s >= 150).astype(np.float32)
+    
+    # Saturation scaling based on luminance (brighter areas get slightly less saturation)
+    sat_scale = np.clip(1.15 - luminance * 0.4, 0.6, 1.0)
+    
+    # Apply hue uniformly
+    hsv[:, :, 0] = original_h * (1 - m) + target_h * m
+    
+    # Aggressive saturation injection for different saturation levels
+    new_sat = (
+        very_low_sat * target_s * sat_scale * 0.95 +  # Very aggressive for whites
+        low_sat * target_s * sat_scale * 0.90 +       # Strong for light grays
+        mid_sat * (target_s * 0.75 + original_s * 0.25) * sat_scale +
+        high_sat * (target_s * 0.55 + original_s * 0.45) * sat_scale
+    )
+    hsv[:, :, 1] = original_s * (1 - m) + new_sat * m
+    
+    # Value adjustment: darken very bright whites, preserve texture in mid-tones
+    bright_white = ((original_v > 220) & (original_s < 50)).astype(np.float32)
+    very_bright = ((original_v > 245) & (original_s < 30)).astype(np.float32)
+    
+    # Adaptive darkening based on how white the area is
+    darken_amount = bright_white * 25 + very_bright * 15  # Up to 40 for pure white
+    new_v = original_v - darken_amount * m
+    hsv[:, :, 2] = np.clip(new_v, 0, 255)
     
     hsv = np.clip(hsv, [0, 0, 0], [179, 255, 255])
-    result = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR)
+    hsv_result = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR).astype(np.float32)
+    
+    # Color multiply blend for stubborn whites (adds color tint naturally)
+    # Create target color in BGR
+    target_bgr = cv2.cvtColor(np.uint8([[[target_h, target_s, 255]]]), cv2.COLOR_HSV2BGR)[0][0].astype(np.float32)
+    target_bgr = target_bgr / 255.0
+    
+    # Multiply blend: result = base * overlay (darkens and tints)
+    img_norm = image.astype(np.float32) / 255.0
+    multiply_result = img_norm * target_bgr * 255.0
+    
+    # Blend multiply result into very white areas only
+    white_blend = (very_low_sat * m)[:, :, np.newaxis] * 0.35  # 35% multiply blend for whites
+    hsv_result = hsv_result * (1 - white_blend) + multiply_result * white_blend
     
     # Edge blending
     m_blur = cv2.GaussianBlur(m, (15, 15), 0)[:, :, np.newaxis]
-    return (result * m_blur + image * (1 - m_blur)).astype(np.uint8)
+    return np.clip(hsv_result * m_blur + image.astype(np.float32) * (1 - m_blur), 0, 255).astype(np.uint8)
 
 
 @app.post("/recolor")

@@ -14,10 +14,10 @@ CLOTHING_CLASSES = [0]  # Person class - we'll extract clothing from person mask
 
 
 def get_yolo_model():
-    """Load YOLO11-medium segmentation model (singleton)."""
+    """Load YOLO11-large segmentation model (singleton)."""
     global YOLO_SEG
     if YOLO_SEG is None:
-        YOLO_SEG = YOLO('yolo11m-seg.pt')
+        YOLO_SEG = YOLO('yolo11l-seg.pt')
     return YOLO_SEG
 
 
@@ -69,33 +69,62 @@ def extract_skin_mask(image: np.ndarray) -> np.ndarray:
 def recolor_clothing(image: np.ndarray, target_color: tuple, clothing_mask: np.ndarray) -> np.ndarray:
     """
     Recolor clothing while preserving texture and shading.
+    Handles white/light colored clothing aggressively with color multiplication.
     
     Args:
         image: BGR image
         target_color: Target color as (H, S, V) where H is 0-179, S and V are 0-255
         clothing_mask: Binary mask of clothing region
     """
-    # Convert to HSV
+    # Convert to HSV and LAB for better color manipulation
     hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV).astype(np.float32)
+    lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB).astype(np.float32)
     
     # Create normalized mask
     mask_norm = (clothing_mask / 255.0).astype(np.float32)
-    mask_3ch = np.stack([mask_norm] * 3, axis=-1)
     
     # Target HSV
     target_h, target_s, target_v = target_color
     
-    # Preserve original value (brightness) for texture
+    # Get original values
+    original_h = hsv[:, :, 0].copy()
+    original_s = hsv[:, :, 1].copy()
     original_v = hsv[:, :, 2].copy()
     
-    # Shift hue to target
-    hsv[:, :, 0] = hsv[:, :, 0] * (1 - mask_norm) + target_h * mask_norm
+    # Luminance from LAB (more perceptually accurate)
+    luminance = lab[:, :, 0] / 255.0
     
-    # Blend saturation (keep some original for natural look)
-    hsv[:, :, 1] = hsv[:, :, 1] * (1 - mask_norm * 0.7) + target_s * mask_norm * 0.7
+    # Categorize pixels by saturation level
+    very_low_sat = (original_s < 30).astype(np.float32)  # Pure white/gray
+    low_sat = ((original_s >= 30) & (original_s < 80)).astype(np.float32)
+    mid_sat = ((original_s >= 80) & (original_s < 150)).astype(np.float32)
+    high_sat = (original_s >= 150).astype(np.float32)
     
-    # Keep original brightness/texture
-    hsv[:, :, 2] = original_v
+    # Saturation scaling based on luminance
+    sat_scale = np.clip(1.15 - luminance * 0.4, 0.6, 1.0)
+    
+    # Apply hue uniformly in masked region
+    hsv[:, :, 0] = original_h * (1 - mask_norm) + target_h * mask_norm
+    
+    # Aggressive saturation injection for different saturation levels
+    new_saturation = (
+        very_low_sat * target_s * sat_scale * 0.95 +  # Very aggressive for whites
+        low_sat * target_s * sat_scale * 0.90 +       # Strong for light grays
+        mid_sat * (target_s * 0.75 + original_s * 0.25) * sat_scale +
+        high_sat * (target_s * 0.55 + original_s * 0.45) * sat_scale
+    )
+    
+    # Apply new saturation only in masked region
+    hsv[:, :, 1] = original_s * (1 - mask_norm) + new_saturation * mask_norm
+    
+    # Value adjustment: darken very bright whites, preserve texture in mid-tones
+    bright_white = ((original_v > 220) & (original_s < 50)).astype(np.float32)
+    very_bright = ((original_v > 245) & (original_s < 30)).astype(np.float32)
+    
+    # Adaptive darkening based on how white the area is
+    darken_amount = bright_white * 25 + very_bright * 15  # Up to 40 for pure white
+    new_v = original_v - darken_amount * mask_norm
+    hsv[:, :, 2] = np.clip(new_v, 0, 255)
     
     # Clip values
     hsv[:, :, 0] = np.clip(hsv[:, :, 0], 0, 179)
@@ -103,12 +132,25 @@ def recolor_clothing(image: np.ndarray, target_color: tuple, clothing_mask: np.n
     hsv[:, :, 2] = np.clip(hsv[:, :, 2], 0, 255)
     
     # Convert back to BGR
-    result = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR)
+    hsv_result = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR).astype(np.float32)
+    
+    # Color multiply blend for stubborn whites (adds color tint naturally)
+    # Create target color in BGR
+    target_bgr = cv2.cvtColor(np.uint8([[[target_h, target_s, 255]]]), cv2.COLOR_HSV2BGR)[0][0].astype(np.float32)
+    target_bgr = target_bgr / 255.0
+    
+    # Multiply blend: result = base * overlay (darkens and tints)
+    img_norm = image.astype(np.float32) / 255.0
+    multiply_result = img_norm * target_bgr * 255.0
+    
+    # Blend multiply result into very white areas only
+    white_blend = (very_low_sat * mask_norm)[:, :, np.newaxis] * 0.35  # 35% multiply blend for whites
+    hsv_result = hsv_result * (1 - white_blend) + multiply_result * white_blend
     
     # Smooth blending at edges
     mask_blur = cv2.GaussianBlur(mask_norm, (15, 15), 0)
     mask_3ch_blur = np.stack([mask_blur] * 3, axis=-1)
-    result = (result * mask_3ch_blur + image * (1 - mask_3ch_blur)).astype(np.uint8)
+    result = np.clip(hsv_result * mask_3ch_blur + image.astype(np.float32) * (1 - mask_3ch_blur), 0, 255).astype(np.uint8)
     
     return result
 
@@ -169,4 +211,4 @@ def recolor(input_path: str, output_path: str, color: str = 'red'):
 
 if __name__ == '__main__':
     # Example: Change clothing to blue
-    recolor('person.jpg', 'recolored_result.jpg', color='pink')
+    recolor('tests/person.jpg', 'tests/recolored_result.jpg', color='pink')
